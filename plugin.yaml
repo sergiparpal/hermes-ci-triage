@@ -1,0 +1,9 @@
+name: hermes-ci-triage
+version: 0.1.0
+description: "Classifies CI/CD pipeline failures into a stable taxonomy and learns per-project failure patterns."
+author: "sergiparpal"
+provides_tools: [triage_pipeline_failure]
+provides_hooks: []
+# requires_env is intentionally omitted so the plugin ALWAYS loads. Remote-log
+# fetching reads GITHUB_TOKEN at handler time (optional); a missing token must
+# not disable the whole plugin, because local-path triage needs no credentials.
