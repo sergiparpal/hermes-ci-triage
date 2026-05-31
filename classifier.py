@@ -17,13 +17,16 @@ shape of :class:`agent.plugin_llm.PluginLlmStructuredResult`.
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, Optional
+
+from . import taxonomy
+from .ports import LlmPort
 
 logger = logging.getLogger(__name__)
 
-# Fixed taxonomy — the contract. Keep in sync with CLASSIFICATION_SCHEMA.
-TAXONOMY = ["broken_test", "environment", "data", "timeout", "flaky", "infra"]
+# The taxonomy is the contract; it is defined once in ``taxonomy.py``. This name
+# is a re-export so callers and tests keep referring to ``classifier.TAXONOMY``.
+TAXONOMY = taxonomy.TAXONOMY
 
 CLASSIFICATION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -37,24 +40,7 @@ CLASSIFICATION_SCHEMA: dict[str, Any] = {
     "required": ["category", "confidence", "summary"],
 }
 
-_CATEGORY_DEFINITIONS = """\
-- broken_test: A genuine code/test defect. Assertion failures, unexpected \
-exceptions in product or test code, wrong expected values. The test correctly \
-caught something, or the test itself is wrong.
-- environment: The build/runtime environment is misconfigured. Missing or \
-incompatible dependencies, import/module-not-found, wrong language/tool \
-version, missing binaries, permission errors, bad PATH or env vars.
-- data: Bad or missing input/fixture/seed data, schema/migration mismatches, \
-serialization/deserialization of data, malformed test data — the code is fine \
-but the data it was given is not.
-- timeout: A step, test, or job exceeded its time budget. "timed out", \
-TimeoutError, deadline exceeded, watchdog/hang kills.
-- flaky: Non-deterministic failure: passes on retry, race conditions, order \
-dependence, intermittent network/timing flakes explicitly noted as flaky.
-- infra: CI infrastructure problem unrelated to the code: runner died, out of \
-disk/memory (OOM), registry/network 5xx, rate limits, connection refused, \
-image pull failures, agent disconnects.
-"""
+_CATEGORY_DEFINITIONS = taxonomy.definitions_block()
 
 INSTRUCTIONS = f"""\
 You are a CI/CD failure triage classifier. Read the failure excerpt and \
@@ -85,31 +71,10 @@ that drove the decision. "suggested_action" is one concrete next step.
 _HEURISTIC_CONFIDENCE = 0.3   # a rule fired
 _DEFAULT_CONFIDENCE = 0.1     # no rule fired — defaulted to broken_test
 
-# Ordered (category, regex) rules; first match wins. Order encodes priority:
-# the more specific / less ambiguous signals come first.
-_HEURISTIC_RULES = [
-    ("flaky", re.compile(r"\bflak|\bintermittent\b|passed on retry|retr(?:y|ied)\b|race condition", re.I)),
-    ("timeout", re.compile(r"timed out|timeouterror|deadline exceeded|\btimeout\b|exceeded the (?:time|timeout)", re.I)),
-    ("infra", re.compile(
-        r"no space left on device|oomkilled|out of memory|cannot allocate memory"
-        r"|connection (?:refused|reset)|could not resolve host|network is unreachable"
-        r"|\b5\d\d\b.*(?:gateway|server|service)|rate limit|too many requests"
-        r"|runner (?:lost|disconnect|terminated)|error pulling image|manifest unknown"
-        r"|docker(?:d)?: ", re.I)),
-    ("environment", re.compile(
-        r"modulenotfounderror|no module named|importerror|cannot find module"
-        r"|command not found|no such file or directory.*(?:bin|exe)?"
-        r"|version `?\S+'? not found|incompatible version|unsupported version"
-        r"|permission denied|could not find a version that satisfies"
-        r"|enoent|\bglibc\b|\.so(?:\.\d+)*: cannot open", re.I)),
-    ("data", re.compile(
-        r"jsondecodeerror|fixture|seed data|schema (?:mismatch|validation|error)"
-        r"|migration|malformed|could not (?:parse|deserialize|decode)"
-        r"|unexpected (?:eof|token)|invalid (?:json|yaml|csv|payload)", re.I)),
-    ("broken_test", re.compile(
-        r"assertionerror|assert\b|\d+ failed\b|FAILED \S|expected .* (?:but|to)"
-        r"|test failure|<failure", re.I)),
-]
+# Ordered (category, regex) rules; first match wins. Defined once in
+# ``taxonomy.py`` — the order encodes priority (see ``Category.priority`` there:
+# the more specific / less ambiguous signals are tried first).
+_HEURISTIC_RULES = taxonomy.HEURISTIC_RULES
 
 
 def heuristic_classify(excerpt: str) -> dict[str, Any]:
@@ -133,7 +98,7 @@ def heuristic_classify(excerpt: str) -> dict[str, Any]:
             }
     # No signal recognised — default to broken_test at very low confidence.
     return {
-        "category": "broken_test",
+        "category": taxonomy.DEFAULT_CATEGORY,
         "confidence": _DEFAULT_CONFIDENCE,
         "summary": "No distinctive failure signal recognised; defaulted.",
         "evidence": [],
@@ -226,7 +191,7 @@ def _normalise_result(parsed: Any) -> Optional[dict[str, Any]]:
 
 
 def classify(
-    llm: Any,
+    llm: Optional[LlmPort],
     excerpt: str,
     *,
     prior: Optional[dict[str, Any]] = None,

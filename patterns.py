@@ -71,9 +71,19 @@ def normalize_signature_text(text: str) -> str:
     return out.strip()
 
 
-def compute_signature(excerpt: str) -> str:
-    """Return a stable SHA-1 hex signature for a (pre-filtered) excerpt."""
+def compute_signature(excerpt: str) -> Optional[str]:
+    """Return a stable SHA-1 hex signature for a (pre-filtered) excerpt.
+
+    Returns ``None`` for a *degenerate* excerpt — one whose volatile tokens
+    normalise away to nothing (blank/whitespace-only, or pure timestamps/IDs).
+    Such an excerpt hashes to the empty-string signature, which would collide
+    across every such log, so it must not be stored or looked up. Returning
+    ``None`` keeps that rule inside the store instead of forcing the caller to
+    re-derive it by testing the normalised text for emptiness.
+    """
     normalised = normalize_signature_text(excerpt)
+    if not normalised:
+        return None
     # Non-cryptographic content fingerprint (dedup key), hence usedforsecurity=False.
     return hashlib.sha1(
         normalised.encode("utf-8", "replace"), usedforsecurity=False

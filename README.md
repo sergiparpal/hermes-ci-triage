@@ -155,18 +155,23 @@ is no sandbox.** Specifically:
 hermes-ci-triage/
 ├── plugin.yaml      # manifest (always loads; no requires_env gate)
 ├── __init__.py      # register(ctx) — the only file that touches Hermes
+├── ports.py         # typing.Protocols for the injected llm / dispatch_tool
+├── taxonomy.py      # single source of truth for the 6-category taxonomy
+├── safehttp.py      # hardened HTTPS opener + SSRF address vetting
 ├── logfetch.py      # local/remote retrieval (HTTPS + byte cap)
 ├── prefilter.py     # regex pre-filtering → bounded excerpt
-├── classifier.py    # taxonomy + complete_structured + heuristic fallback
+├── classifier.py    # complete_structured + heuristic fallback (taxonomy-driven)
 ├── patterns.py      # SQLite pattern store (signature, FTS5/LIKE, retention)
+├── enrichment.py    # optional partner test-history lookup (guarded adapter)
 ├── handlers.py      # pipeline glue
 ├── tests/           # pytest suite (importlib mode; see tests/pytest.ini)
 └── README.md
 ```
 
-`logfetch`, `prefilter`, `classifier`, `patterns`, and `handlers` import
-nothing from Hermes — they are pure standard library and unit-test in
-isolation. `__init__.py` is the only Hermes-facing module.
+Every module except `__init__.py` imports nothing from Hermes — they are pure
+standard library and unit-test in isolation. `__init__.py` is the only
+Hermes-facing module: it resolves `hermes_home` and injects it alongside `llm`
+and `dispatch_tool` into the pipeline.
 
 ## Tests
 

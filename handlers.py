@@ -24,16 +24,15 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
-from . import classifier, logfetch, patterns, prefilter, redact
+from . import classifier, enrichment, logfetch, patterns, prefilter, redact
+from .ports import LlmPort, ToolDispatcher
 
 logger = logging.getLogger(__name__)
 
 # How many tail lines to classify when the log carries no clear failure signal.
 _NO_SIGNAL_TAIL_LINES = 60
-# Cap on the single signal line used to seed enrichment lookups.
-_SIGNAL_LINE_CHARS = 200
 _DB_RELATIVE = ("cache", "ci_triage_patterns.db")
 
 
@@ -57,18 +56,17 @@ def _ok(payload: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 
 def _resolve_hermes_home(hermes_home: Optional[str]) -> Path:
+    """Resolve the Hermes home directory without importing anything from Hermes.
+
+    The profile-aware resolution (``hermes_constants.get_hermes_home()``) is done
+    once in ``__init__.register`` and injected as ``hermes_home``; this keeps the
+    orchestrator Hermes-free. The env fallback only serves the direct-call path
+    (tests, or a caller that does not inject a home).
+    """
     if hermes_home:
         return Path(hermes_home)
-    try:
-        from hermes_constants import get_hermes_home  # type: ignore
-        return get_hermes_home()
-    except Exception:
-        logger.debug(
-            "hermes_constants unavailable; resolving HERMES_HOME from env",
-            exc_info=True,
-        )
-        val = (os.environ.get("HERMES_HOME") or "").strip()
-        return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
+    val = (os.environ.get("HERMES_HOME") or "").strip()
+    return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
 
 
 def _db_path(hermes_home: Optional[str]) -> Path:
@@ -87,55 +85,6 @@ def _infer_project(args: dict[str, Any]) -> str:
 def _tail_excerpt(raw: str, n_lines: int = _NO_SIGNAL_TAIL_LINES) -> str:
     lines = prefilter.strip_ansi(raw).split("\n")
     return "\n".join(lines[-n_lines:])
-
-
-def _is_unknown_tool(data: Any) -> bool:
-    """True for a registry-miss envelope: a lone ``{"error": "..."}``.
-
-    A tool that actually ran returns more than just an error key, so the
-    single-key shape is what distinguishes 'tool not registered' from a tool
-    that ran and reported a problem worth surfacing.
-    """
-    return isinstance(data, dict) and bool(data.get("error")) and len(data) == 1
-
-
-def _try_enrich(
-    dispatch_tool: Optional[Callable[..., str]], excerpt: str
-) -> Optional[Any]:
-    """Guarded optional enrichment via a test-history tool.
-
-    Non-fatal: any absence/error returns ``None``. We deliberately do not
-    name the tool in the user-facing schema; the dependency is soft.
-    """
-    if dispatch_tool is None:
-        return None
-    query = _top_signal_line(excerpt)
-    for tool_name, arg_key in (
-        ("test_failure_lookup", "query"),
-        ("module_failure_history", "query"),
-    ):
-        try:
-            raw = dispatch_tool(tool_name, {arg_key: query})
-        except Exception:
-            logger.debug("enrichment via %s failed", tool_name, exc_info=True)
-            continue
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw) if isinstance(raw, str) else raw
-        except (json.JSONDecodeError, ValueError):
-            data = raw
-        if _is_unknown_tool(data):
-            continue
-        return {"source": tool_name, "result": data}
-    return None
-
-
-def _top_signal_line(excerpt: str) -> str:
-    for line in (excerpt or "").split("\n"):
-        if prefilter.is_failure_line(line):
-            return line.strip()[:_SIGNAL_LINE_CHARS]
-    return (excerpt or "").strip().split("\n")[0][:_SIGNAL_LINE_CHARS]
 
 
 def _open_and_lookup(
@@ -169,8 +118,8 @@ def _open_and_lookup(
 def triage_pipeline_failure(
     args: dict[str, Any],
     *,
-    llm: Any = None,
-    dispatch_tool: Optional[Callable[..., str]] = None,
+    llm: Optional[LlmPort] = None,
+    dispatch_tool: Optional[ToolDispatcher] = None,
     hermes_home: Optional[str] = None,
     enable_enrichment: bool = True,
 ) -> str:
@@ -212,28 +161,29 @@ def triage_pipeline_failure(
     excerpt = redact.redact(excerpt)
 
     # --- signature + prior ----------------------------------------------
+    # The store owns the "degenerate excerpt" rule: compute_signature returns
+    # None when the excerpt normalises to nothing (it would otherwise collide
+    # across all such logs), so a None signature means skip the store entirely.
     signature = patterns.compute_signature(excerpt)
-    # An excerpt that normalises to nothing yields the empty-string signature,
-    # which would collide across all such logs — skip the store entirely.
-    has_signature = bool(patterns.normalize_signature_text(excerpt))
     store: Optional[patterns.PatternStore] = None
     prior: Optional[dict[str, Any]] = None
-    if has_signature:
+    if signature is not None:
         store, prior = _open_and_lookup(
             _db_path(hermes_home), project, signature, excerpt
         )
 
     # --- optional enrichment (guarded) ----------------------------------
-    enrichment = None
+    enrichment_data = None
     if enable_enrichment:
-        enrichment = _try_enrich(dispatch_tool, excerpt)
-        if enrichment is not None:
+        enrichment_data = enrichment.enrich(dispatch_tool, excerpt)
+        if enrichment_data is not None:
             # Another tool's output may also carry secrets — scrub before it is
-            # fed to the LLM or echoed in the result.
-            enrichment = redact.redact_obj(enrichment)
+            # fed to the LLM or echoed in the result. Redaction is the
+            # orchestrator's single chokepoint; enrichment.enrich never redacts.
+            enrichment_data = redact.redact_obj(enrichment_data)
 
     # --- classify --------------------------------------------------------
-    result = classifier.classify(llm, excerpt, prior=prior, enrichment=enrichment)
+    result = classifier.classify(llm, excerpt, prior=prior, enrichment=enrichment_data)
 
     # --- record ----------------------------------------------------------
     prior_occurrences = int(prior.get("occurrences", 0)) if prior else 0
@@ -260,7 +210,7 @@ def triage_pipeline_failure(
         "prior_seen": prior is not None,
         "prior_occurrences": prior_occurrences,
         "project": project,
-        "signature": signature,
+        "signature": signature or "",
         "log_stats": {
             "original_bytes": stats.get("original_bytes", 0),
             "hit_count": stats.get("hit_count", 0),
@@ -270,6 +220,6 @@ def triage_pipeline_failure(
     }
     if prior is not None and prior.get("fuzzy"):
         payload["prior_match"] = "fuzzy"
-    if enrichment is not None:
-        payload["enrichment"] = enrichment
+    if enrichment_data is not None:
+        payload["enrichment"] = enrichment_data
     return _ok(payload)

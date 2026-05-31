@@ -1,4 +1,9 @@
-"""logfetch: local reads, byte cap, scheme + auth handling."""
+"""logfetch: local reads, byte cap, scheme + auth handling.
+
+Transport hardening (SSRF address vetting, the guarded redirect/connect path)
+now lives in ``safehttp``; those tests reference it there. ``LogFetchError`` is
+re-exported by ``logfetch`` so it is still asserted via ``logfetch.LogFetchError``.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,7 @@ import urllib.request
 
 import pytest
 
-from hermes_plugins.hermes_ci_triage import logfetch
+from hermes_plugins.hermes_ci_triage import logfetch, safehttp
 
 
 def test_is_remote():
@@ -90,11 +95,11 @@ def test_missing_token_path_structured_error(monkeypatch):
     """An auth failure (no/insufficient token) surfaces a LogFetchError with a
     GITHUB_TOKEN remediation — no raw traceback leaks."""
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
+    monkeypatch.setattr(safehttp, "is_blocked_address", lambda host: False)
     err = urllib.error.HTTPError(
         "https://api.github.com/x", 401, "Unauthorized", {}, None
     )
-    monkeypatch.setattr(logfetch, "_build_opener", lambda ctx: _CaptureOpener(raises=err))
+    monkeypatch.setattr(safehttp, "build_opener", lambda ctx: _CaptureOpener(raises=err))
     with pytest.raises(logfetch.LogFetchError) as ei:
         logfetch.fetch_remote("https://api.github.com/repos/o/r/actions/jobs/1/logs")
     assert "GITHUB_TOKEN" in ei.value.remediation
@@ -103,9 +108,9 @@ def test_missing_token_path_structured_error(monkeypatch):
 def test_token_not_sent_to_foreign_host(monkeypatch):
     """The token must NOT be attached to a non-GitHub host (credential leak)."""
     monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
-    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
+    monkeypatch.setattr(safehttp, "is_blocked_address", lambda host: False)
     cap = _CaptureOpener()
-    monkeypatch.setattr(logfetch, "_build_opener", lambda ctx: cap)
+    monkeypatch.setattr(safehttp, "build_opener", lambda ctx: cap)
     out = logfetch.fetch_remote("https://evil.example/log")
     assert "ERROR boom" in out
     assert not any(k.lower() == "authorization" for k in cap.request.headers)
@@ -114,9 +119,9 @@ def test_token_not_sent_to_foreign_host(monkeypatch):
 def test_token_sent_to_github_api(monkeypatch):
     """The token IS attached for the allow-listed GitHub API host."""
     monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
-    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
+    monkeypatch.setattr(safehttp, "is_blocked_address", lambda host: False)
     cap = _CaptureOpener()
-    monkeypatch.setattr(logfetch, "_build_opener", lambda ctx: cap)
+    monkeypatch.setattr(safehttp, "build_opener", lambda ctx: cap)
     logfetch.fetch_remote("https://api.github.com/repos/o/r/actions/jobs/1/logs")
     auth = next(v for k, v in cap.request.headers.items() if k.lower() == "authorization")
     assert auth == "Bearer secret-token"
@@ -131,8 +136,8 @@ def test_ssrf_internal_address_rejected(monkeypatch):
 
 
 def test_redirect_strips_auth_cross_host(monkeypatch):
-    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
-    handler = logfetch._SafeRedirectHandler()
+    monkeypatch.setattr(safehttp, "is_blocked_address", lambda host: False)
+    handler = safehttp.SafeRedirectHandler()
     req = urllib.request.Request(
         "https://api.github.com/x", headers={"Authorization": "Bearer t"}
     )
@@ -142,8 +147,8 @@ def test_redirect_strips_auth_cross_host(monkeypatch):
 
 
 def test_redirect_keeps_auth_same_host(monkeypatch):
-    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
-    handler = logfetch._SafeRedirectHandler()
+    monkeypatch.setattr(safehttp, "is_blocked_address", lambda host: False)
+    handler = safehttp.SafeRedirectHandler()
     req = urllib.request.Request(
         "https://api.github.com/x", headers={"Authorization": "Bearer t"}
     )
@@ -154,8 +159,8 @@ def test_redirect_keeps_auth_same_host(monkeypatch):
 def test_redirect_to_internal_address_refused(monkeypatch):
     """H1: the SSRF blocklist must apply to redirect targets, not just the
     initial URL — a public URL must not be able to 302 to cloud metadata."""
-    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: True)
-    handler = logfetch._SafeRedirectHandler()
+    monkeypatch.setattr(safehttp, "is_blocked_address", lambda host: True)
+    handler = safehttp.SafeRedirectHandler()
     req = urllib.request.Request("https://logs.example/x")
     with pytest.raises(logfetch.LogFetchError) as ei:
         handler.redirect_request(
@@ -167,8 +172,8 @@ def test_redirect_to_internal_address_refused(monkeypatch):
 def test_redirect_to_non_https_refused(monkeypatch):
     """H1: a redirect that downgrades to http:// must be refused (no scheme
     downgrade to e.g. http://169.254.169.254/)."""
-    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
-    handler = logfetch._SafeRedirectHandler()
+    monkeypatch.setattr(safehttp, "is_blocked_address", lambda host: False)
+    handler = safehttp.SafeRedirectHandler()
     req = urllib.request.Request("https://logs.example/x")
     with pytest.raises(logfetch.LogFetchError):
         handler.redirect_request(req, None, 302, "Found", {}, "http://logs.example/y")
@@ -180,21 +185,21 @@ def test_private_address_blocked_by_default(monkeypatch):
     import ipaddress
 
     monkeypatch.delenv("HERMES_CI_TRIAGE_ALLOW_PRIVATE", raising=False)
-    assert logfetch._ip_blocked(ipaddress.ip_address("10.0.0.5")) is True
-    assert logfetch._ip_blocked(ipaddress.ip_address("192.168.1.1")) is True
+    assert safehttp.ip_blocked(ipaddress.ip_address("10.0.0.5")) is True
+    assert safehttp.ip_blocked(ipaddress.ip_address("192.168.1.1")) is True
 
     monkeypatch.setenv("HERMES_CI_TRIAGE_ALLOW_PRIVATE", "1")
-    assert logfetch._ip_blocked(ipaddress.ip_address("10.0.0.5")) is False
-    assert logfetch._ip_blocked(ipaddress.ip_address("127.0.0.1")) is True
-    assert logfetch._ip_blocked(ipaddress.ip_address("169.254.169.254")) is True
+    assert safehttp.ip_blocked(ipaddress.ip_address("10.0.0.5")) is False
+    assert safehttp.ip_blocked(ipaddress.ip_address("127.0.0.1")) is True
+    assert safehttp.ip_blocked(ipaddress.ip_address("169.254.169.254")) is True
 
 
 def test_guarded_connection_refuses_resolved_internal_ip(monkeypatch):
     """M2: connect-time IP vetting refuses a name that resolves to an internal
     address (closes the DNS-rebinding TOCTOU window)."""
-    conn = logfetch._GuardedHTTPSConnection("rebind.example", 443)
+    conn = safehttp.GuardedHTTPSConnection("rebind.example", 443)
     monkeypatch.setattr(
-        logfetch.socket, "getaddrinfo",
+        safehttp.socket, "getaddrinfo",
         lambda *a, **k: [(2, 1, 6, "", ("127.0.0.1", 443))],
     )
     with pytest.raises(logfetch.LogFetchError):

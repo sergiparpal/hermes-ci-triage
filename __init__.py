@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 from . import handlers
@@ -105,9 +107,30 @@ def _check_version() -> None:
         logger.debug("could not determine Hermes version for guard", exc_info=True)
 
 
+def _resolve_home() -> str:
+    """Resolve the Hermes home directory — the one place that may touch Hermes.
+
+    Prefers the host's profile-aware ``hermes_constants.get_hermes_home()`` and
+    falls back to ``$HERMES_HOME`` / ``~/.hermes``. Resolved once at
+    registration (when the active profile is known) and injected into the
+    handler, so every pipeline module stays free of Hermes imports.
+    """
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+        return str(get_hermes_home())
+    except Exception:
+        logger.debug(
+            "hermes_constants unavailable; resolving HERMES_HOME from env",
+            exc_info=True,
+        )
+        val = (os.environ.get("HERMES_HOME") or "").strip()
+        return str(Path(val).resolve() if val else (Path.home() / ".hermes").resolve())
+
+
 def register(ctx: Any) -> None:
     """Plugin entry point — register the triage tool."""
     _check_version()
+    hermes_home = _resolve_home()
 
     def handler(args, **kwargs):
         try:
@@ -115,6 +138,7 @@ def register(ctx: Any) -> None:
                 args if isinstance(args, dict) else {},
                 llm=getattr(ctx, "llm", None),
                 dispatch_tool=getattr(ctx, "dispatch_tool", None),
+                hermes_home=hermes_home,
                 enable_enrichment=ENABLE_ENRICHMENT,
             )
         except Exception as exc:  # last-resort guard — handler is the boundary

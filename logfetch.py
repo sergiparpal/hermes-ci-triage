@@ -11,14 +11,18 @@ Turns a ``log_url_or_path`` into raw text, safely, for two input shapes:
   surfaces as a :class:`LogFetchError` carrying a remediation hint rather than
   a raw traceback.
 
+This module owns *retrieval policy* (provider/token scoping, local-file roots,
+byte caps, error mapping). The security-critical transport hardening — HTTPS-
+only redirect/connect guards and SSRF address vetting — lives in the lower-level
+:mod:`safehttp`, from which :class:`LogFetchError` is re-exported here so callers
+keep using ``logfetch.LogFetchError``.
+
 Pure standard library (``os``, ``ssl``, ``socket``, ``urllib``) — no Hermes
 dependency, so it unit-tests in isolation.
 """
 
 from __future__ import annotations
 
-import http.client
-import ipaddress
 import os
 import socket
 import ssl
@@ -26,6 +30,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from . import safehttp
+from .safehttp import LogFetchError  # re-export: public API + local raises
 
 # --------------------------------------------------------------------------
 # Provider configuration — chosen at design time (decision point 1:
@@ -44,31 +51,11 @@ _USER_AGENT = "hermes-ci-triage/0.1"
 # Remediation hints reused across several LogFetchErrors.
 _PERMS_HINT = "Check the path and file permissions."
 _TIMEOUT_HINT = "Retry, or point at a smaller/specific job log."
-_SSRF_HINT = (
-    "Point at a public CI log URL; loopback, link-local, reserved and (by "
-    "default) private/internal addresses are blocked to prevent SSRF. To allow "
-    "RFC1918 ranges for self-hosted / GitHub Enterprise runners set "
-    "HERMES_CI_TRIAGE_ALLOW_PRIVATE=1."
-)
 
-# Opt-in to permit RFC1918/private fetch destinations (self-hosted / GHE).
-_ALLOW_PRIVATE_ENV = "HERMES_CI_TRIAGE_ALLOW_PRIVATE"
 # Optional allowlist of directories local logs may be read from (os.pathsep-
 # separated). Unset = no restriction (default); set it to confine reads so the
 # tool cannot be steered into reading arbitrary files (~/.ssh/id_rsa, .env, …).
 _LOG_ROOTS_ENV = "HERMES_CI_TRIAGE_LOG_ROOTS"
-
-
-def _safe_url(url: str) -> str:
-    """Scheme+host only — never echo a URL's path/query (may carry tokens/IDs)."""
-    try:
-        parts = urlsplit(url)
-        if parts.scheme and parts.hostname:
-            suffix = f":{parts.port}" if parts.port else ""
-            return f"{parts.scheme}://{parts.hostname}{suffix}"
-    except ValueError:
-        pass
-    return "the requested URL"
 
 
 def _safe_path(path: str) -> str:
@@ -78,18 +65,6 @@ def _safe_path(path: str) -> str:
         return base or "the requested file"
     except Exception:
         return "the requested file"
-
-
-class LogFetchError(Exception):
-    """A recoverable log-retrieval failure.
-
-    ``remediation`` is an operator-facing hint the handler surfaces in the
-    structured error envelope (e.g. "set GITHUB_TOKEN").
-    """
-
-    def __init__(self, message: str, remediation: str = "") -> None:
-        super().__init__(message)
-        self.remediation = remediation
 
 
 def is_remote(target: str) -> bool:
@@ -113,7 +88,7 @@ def has_remote_credentials() -> bool:
 
 
 # --------------------------------------------------------------------------
-# Outbound-request safety (token scoping + SSRF)
+# Token scoping (which hosts may receive the auth header)
 # --------------------------------------------------------------------------
 
 # The auth token is sent ONLY to these hosts. GitHub Actions job-log URLs live on
@@ -138,165 +113,11 @@ def _host_allows_token(host: str) -> bool:
     return host in _token_hosts() or host.endswith(".githubusercontent.com")
 
 
-def _allow_private() -> bool:
-    """Whether RFC1918/private fetch destinations are permitted (opt-in)."""
-    return os.environ.get(_ALLOW_PRIVATE_ENV, "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
-
-
-def _ip_blocked(ip) -> bool:
-    # Always block the SSRF-sensitive ranges: cloud metadata (169.254.169.254 is
-    # link-local), loopback/localhost services, and unspecified/multicast/
-    # reserved space. These stay blocked even when private ranges are permitted.
-    if (
-        ip.is_loopback
-        or ip.is_link_local
-        or ip.is_unspecified
-        or ip.is_multicast
-        or ip.is_reserved
-    ):
-        return True
-    # Private/internal (RFC1918, CGNAT, …) is blocked by default; self-hosted or
-    # GitHub Enterprise users opt back in via HERMES_CI_TRIAGE_ALLOW_PRIVATE.
-    if ip.is_private and not _allow_private():
-        return True
-    return False
-
-
-def _is_blocked_address(host: str) -> bool:
-    """True if *host* is, or resolves to, a non-routable/internal address."""
-    if not host:
-        return False
-    try:
-        return _ip_blocked(ipaddress.ip_address(host))
-    except ValueError:
-        pass  # not a literal IP — resolve it
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        return False  # let the real connection attempt surface a network error
-    for info in infos:
-        try:
-            if _ip_blocked(ipaddress.ip_address(info[4][0])):
-                return True
-        except ValueError:
-            continue
-    return False
-
-
-class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Follow redirects, but re-apply every safety check on each hop.
-
-    The initial-URL guards (HTTPS-only, SSRF address blocking) are worthless if
-    a redirect can escape them, so each redirect *target* is re-validated here:
-
-    * non-HTTPS targets are refused — no http/ftp downgrade (e.g. a 302 to
-      ``http://169.254.169.254/...`` to reach cloud metadata);
-    * targets that are, or resolve to, loopback/link-local/reserved/(private)
-      addresses are refused (SSRF);
-    * the Authorization header is dropped on cross-host hops — GitHub serves
-      job logs as a 302 to a pre-signed blob URL on a different host, and
-      forwarding the bearer token there would leak it.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is None:
-            return None
-        parts = urlsplit(newurl)
-        if (parts.scheme or "").lower() != "https":
-            raise LogFetchError(
-                f"Refusing redirect to a non-HTTPS target ({_safe_url(newurl)}).",
-                "The log host redirected to a non-HTTPS URL; only https:// "
-                "targets are followed.",
-            )
-        if _is_blocked_address(parts.hostname or ""):
-            raise LogFetchError(
-                "Refusing redirect to a non-routable/internal address "
-                f"({_safe_url(newurl)}).",
-                _SSRF_HINT,
-            )
-        old_host = (urlsplit(req.full_url).hostname or "").lower()
-        new_host = (parts.hostname or "").lower()
-        if old_host != new_host:
-            for key in list(new.headers):
-                if key.lower() == "authorization":
-                    del new.headers[key]
-        return new
-
-
-class _GuardedHTTPSConnection(http.client.HTTPSConnection):
-    """HTTPSConnection that vets the resolved IP at the moment it connects.
-
-    Closes the DNS-rebinding TOCTOU window for direct connections: the address
-    we vet is exactly the one we then connect to. (The stdlib path resolves a
-    second, independent time between an external pre-flight check and the socket
-    connect, so a name that flips from a public to an internal address in
-    between would slip past.)
-
-    When a proxy CONNECT tunnel is in use the proxy performs resolution and we
-    cannot pin the target IP, so we defer to the stdlib path; the pre-flight
-    host check in :func:`fetch_remote` still applies in that case.
-    """
-
-    def connect(self):
-        if getattr(self, "_tunnel_host", None):
-            return super().connect()
-        last_exc = None
-        for _family, _socktype, _proto, _canon, sockaddr in socket.getaddrinfo(
-            self.host, self.port, 0, socket.SOCK_STREAM
-        ):
-            try:
-                blocked = _ip_blocked(ipaddress.ip_address(sockaddr[0]))
-            except ValueError:
-                continue
-            if blocked:
-                raise LogFetchError(
-                    "Refusing to connect to a non-routable/internal address "
-                    f"({sockaddr[0]}).",
-                    _SSRF_HINT,
-                )
-            try:
-                sock = socket.create_connection(
-                    (sockaddr[0], sockaddr[1]),
-                    timeout=self.timeout,
-                    source_address=self.source_address,
-                )
-            except OSError as exc:
-                last_exc = exc
-                continue
-            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
-            return
-        if last_exc is not None:
-            raise last_exc
-        raise OSError(f"no permitted address for host {self.host!r}")
-
-
-class _GuardedHTTPSHandler(urllib.request.HTTPSHandler):
-    """HTTPSHandler that connects via :class:`_GuardedHTTPSConnection`."""
-
-    def https_open(self, req):
-        return self.do_open(_GuardedHTTPSConnection, req, context=self._context)
-
-
-def _build_opener(context: ssl.SSLContext) -> urllib.request.OpenerDirector:
-    # _GuardedHTTPSHandler replaces the default HTTPSHandler and
-    # _SafeRedirectHandler replaces the default redirect handler. The default
-    # plain-HTTP/FTP/File/Data handlers remain installed but are unreachable:
-    # the initial URL is HTTPS-only (fetch_remote) and every redirect target is
-    # re-validated as HTTPS-only by _SafeRedirectHandler *before* any handler is
-    # invoked for it — so no request can reach a non-HTTPS scheme handler.
-    return urllib.request.build_opener(
-        _GuardedHTTPSHandler(context=context),
-        _SafeRedirectHandler(),
-    )
-
-
 def _timeout_error(url: str, timeout: float) -> LogFetchError:
     """The single source of truth for the fetch-timeout error envelope."""
     return LogFetchError(
-        f"Timed out after {timeout}s fetching {_safe_url(url)}.", _TIMEOUT_HINT
+        f"Timed out after {timeout}s fetching {safehttp.safe_url(url)}.",
+        _TIMEOUT_HINT,
     )
 
 
@@ -312,6 +133,10 @@ def _read_capped(resp) -> bytes:
         total += len(chunk)
     return b"".join(chunks)[:MAX_LOG_BYTES]
 
+
+# --------------------------------------------------------------------------
+# Local-file retrieval
+# --------------------------------------------------------------------------
 
 def _log_roots() -> list:
     """Resolved directories that local logs may be read from (opt-in allowlist)."""
@@ -384,12 +209,17 @@ def read_local(path: str) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+# --------------------------------------------------------------------------
+# Remote retrieval
+# --------------------------------------------------------------------------
+
 def fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
     """Fetch a remote log over HTTPS with auth, timeout and byte cap.
 
     Safety: HTTPS only; the token is attached only to GitHub hosts
     (:func:`_host_allows_token`) and stripped on cross-host redirects; requests
-    to loopback/link-local/reserved addresses are refused to blunt SSRF.
+    to loopback/link-local/reserved addresses are refused to blunt SSRF (the
+    redirect/connect-time guards live in :mod:`safehttp`).
     """
     if not (url or "").strip().lower().startswith("https://"):
         raise LogFetchError(
@@ -399,10 +229,10 @@ def fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
         )
 
     host = urlsplit(url).hostname or ""
-    if _is_blocked_address(host):
+    if safehttp.is_blocked_address(host):
         raise LogFetchError(
             f"Refusing to fetch from a non-routable/internal address: {host}",
-            _SSRF_HINT,
+            safehttp.SSRF_HINT,
         )
 
     headers = {"User-Agent": _USER_AGENT, "Accept": "text/plain, */*"}
@@ -412,7 +242,7 @@ def fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
 
     request = urllib.request.Request(url, headers=headers, method="GET")
     context = ssl.create_default_context()
-    opener = _build_opener(context)
+    opener = safehttp.build_opener(context)
     try:
         with opener.open(request, timeout=timeout) as resp:
             data = _read_capped(resp)
@@ -420,17 +250,17 @@ def fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             raise LogFetchError(
-                f"Authentication failed (HTTP {exc.code}) fetching {_safe_url(url)}.",
+                f"Authentication failed (HTTP {exc.code}) fetching {safehttp.safe_url(url)}.",
                 f"Set the {TOKEN_ENV_VAR} environment variable to a token with "
                 f"read access to the CI logs, then retry.",
             )
         if exc.code == 404:
             raise LogFetchError(
-                f"Log not found (HTTP 404): {_safe_url(url)}",
+                f"Log not found (HTTP 404): {safehttp.safe_url(url)}",
                 "Check the URL — the run/job log may have expired or rotated.",
             )
         raise LogFetchError(
-            f"HTTP error {exc.code} fetching {_safe_url(url)}.",
+            f"HTTP error {exc.code} fetching {safehttp.safe_url(url)}.",
             "Verify the URL and your network access.",
         )
     except socket.timeout:
@@ -440,7 +270,7 @@ def fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
         if isinstance(reason, (TimeoutError, socket.timeout)):
             raise _timeout_error(url, timeout)
         raise LogFetchError(
-            f"Network error fetching {_safe_url(url)}: {reason}",
+            f"Network error fetching {safehttp.safe_url(url)}: {reason}",
             "Check connectivity and that the host is reachable.",
         )
 

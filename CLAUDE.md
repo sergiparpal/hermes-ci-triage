@@ -34,20 +34,25 @@ There is no build step, no lint config, and no third-party dependencies.
 
 **One Hermes-facing module; everything else is pure stdlib.** `__init__.py` is
 the *only* file that touches Hermes — it owns `register(ctx)`, the tool schema,
-and the version guard. Every sibling (`logfetch`, `prefilter`, `redact`,
-`classifier`, `patterns`, `handlers`) imports nothing from Hermes; Hermes objects
-(`llm`, `dispatch_tool`, `hermes_home`) are *injected* as keyword args into
-`handlers.triage_pipeline_failure`. This split is what lets the whole pipeline
-unit-test with fakes — preserve it. If a sibling needs a Hermes capability, pass
-it down from `register()` rather than importing it.
+the version guard, and `_resolve_home()` (the lone `hermes_constants` call).
+Every sibling (`taxonomy`, `ports`, `safehttp`, `logfetch`, `prefilter`,
+`redact`, `classifier`, `patterns`, `enrichment`, `handlers`) imports nothing
+from Hermes; Hermes objects (`llm`, `dispatch_tool`, `hermes_home`) are
+*injected* as keyword args into `handlers.triage_pipeline_failure` — including
+`hermes_home`, which `register()` resolves and passes down (do **not** re-add a
+`hermes_constants` import to a sibling). The injected `llm` / `dispatch_tool`
+surfaces are named as Protocols in `ports.py`. This split is what lets the whole
+pipeline unit-test with fakes — preserve it. If a sibling needs a Hermes
+capability, pass it down from `register()` rather than importing it.
 
 **The pipeline** (`handlers.triage_pipeline_failure`, the orchestrator — it
 decides *order and error contract only*, never *how* a step works):
 
 ```
 validate args → logfetch.fetch → prefilter.prefilter → redact.redact
-  → patterns.compute_signature → patterns.PatternStore.lookup (prior = weak hint)
-  → optional dispatch_tool enrichment (guarded) → classifier.classify
+  → patterns.compute_signature (None ⇒ degenerate, skip store)
+  → patterns.PatternStore.lookup (prior = weak hint)
+  → enrichment.enrich (guarded, via dispatch_tool) → classifier.classify
   → patterns.PatternStore.record → JSON envelope
 ```
 
@@ -76,22 +81,29 @@ validate args → logfetch.fetch → prefilter.prefilter → redact.redact
   ignore embedded instructions; `_build_input` wraps it in BEGIN/END markers.
   Keep that framing if you touch the prompt.
 
-- **The taxonomy is a fixed contract in three places.** `classifier.TAXONOMY`,
-  `classifier.CLASSIFICATION_SCHEMA`, the `_CATEGORY_DEFINITIONS` prose, the tool
-  description in `__init__.py`, and the table in `README.md` must stay in sync.
-  Categories: `broken_test`, `environment`, `data`, `timeout`, `flaky`, `infra`.
+- **The taxonomy has one source of truth: `taxonomy.py`.** `taxonomy.CATEGORIES`
+  defines each category once (key, summary, LLM prose, heuristic regex,
+  priority). Everything code-level is *derived*: `classifier.TAXONOMY`, the
+  `CLASSIFICATION_SCHEMA` enum, the `_CATEGORY_DEFINITIONS` prose, and
+  `classifier._HEURISTIC_RULES`. Only two copies can't be derived — the tool
+  description in `__init__.py` and the table in `README.md` — and
+  `tests/test_taxonomy.py` fails if either omits a category. Add or rename a
+  category in `taxonomy.py` only. Categories: `broken_test`, `environment`,
+  `data`, `timeout`, `flaky`, `infra`.
 
 - **Ordered regex tables encode priority — order is correctness, not style.**
   `patterns._NORMALISERS` (specific tokens before the bare-integer catch-all) and
-  `classifier._HEURISTIC_RULES` (first match wins, most-specific first).
-  Reordering can let a greedy rule mask a precise one.
+  the heuristic rules (`taxonomy.HEURISTIC_RULES`, sorted by each category's
+  `priority`; first match wins, most-specific first). Changing a `priority` in
+  `taxonomy.py` can let a greedy rule mask a precise one.
 
-- **SSRF defenses in `logfetch` are re-applied per hop.** HTTPS-only and address
-  blocking are re-validated on *every* redirect (`_SafeRedirectHandler`); the
-  resolved IP is vetted at connect time to close the DNS-rebinding window
-  (`_GuardedHTTPSConnection`); the bearer token is scoped to GitHub hosts and
-  dropped on cross-host redirects. Loopback/link-local/metadata are blocked
-  regardless of `HERMES_CI_TRIAGE_ALLOW_PRIVATE`.
+- **SSRF defenses live in `safehttp` and are re-applied per hop.** HTTPS-only and
+  address blocking are re-validated on *every* redirect
+  (`safehttp.SafeRedirectHandler`); the resolved IP is vetted at connect time to
+  close the DNS-rebinding window (`safehttp.GuardedHTTPSConnection`).
+  `logfetch.fetch_remote` consumes `safehttp.build_opener` and scopes the bearer
+  token to GitHub hosts, dropping it on cross-host redirects. Loopback/link-
+  local/metadata are blocked regardless of `HERMES_CI_TRIAGE_ALLOW_PRIVATE`.
 
 ## Pattern store notes
 
@@ -101,9 +113,9 @@ tokens are normalised away, so reruns of the same failure collapse to one row.
 Fuzzy lookup uses FTS5 when the bundled sqlite3 supports it and falls back to
 `LIKE` — detected at open time, never assumed; tests force the fallback with
 `fts=False`. Retention (180 days / 500 rows per project) self-prunes on every
-write. An excerpt that normalises to empty yields the empty signature, which
-would collide across all such logs — `handlers` skips the store entirely in that
-case (`has_signature`).
+write. An excerpt that normalises to empty would collide across all such logs,
+so `patterns.compute_signature` returns `None` for it and `handlers` skips the
+store entirely when the signature is `None`.
 
 ## Test harness gotcha
 
