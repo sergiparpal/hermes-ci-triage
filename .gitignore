@@ -1,0 +1,20 @@
+# coding agents files
+.codex/
+.claude/
+
+# Python cache files
+__pycache__/
+
+# local dev/test tooling and artifacts
+.venv/
+.covtools/
+.coverage
+.pytest_cache/
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+
+# Windows/WSL "mark of the web" metadata
+*:Zone.Identifier
