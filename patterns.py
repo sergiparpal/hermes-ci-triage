@@ -25,7 +25,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Optional
 
 DEFAULT_RETENTION_DAYS = 180
 DEFAULT_MAX_ROWS_PER_PROJECT = 500
@@ -70,7 +70,10 @@ def normalize_signature_text(text: str) -> str:
 def compute_signature(excerpt: str) -> str:
     """Return a stable SHA-1 hex signature for a (pre-filtered) excerpt."""
     normalised = normalize_signature_text(excerpt)
-    return hashlib.sha1(normalised.encode("utf-8", "replace")).hexdigest()
+    # Non-cryptographic content fingerprint (dedup key), hence usedforsecurity=False.
+    return hashlib.sha1(
+        normalised.encode("utf-8", "replace"), usedforsecurity=False
+    ).hexdigest()
 
 
 def _iso_now(now: Optional[datetime] = None) -> str:
@@ -95,9 +98,9 @@ def fts5_available() -> bool:
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
 
 
-def _fuzzy_tokens(excerpt: str, limit: int = 12) -> List[str]:
+def _fuzzy_tokens(excerpt: str, limit: int = 12) -> list[str]:
     """Pick salient alphanumeric tokens from an excerpt for an FTS query."""
-    seen: Dict[str, None] = {}
+    seen: dict[str, None] = {}
     for tok in _FTS_TOKEN_RE.findall(normalize_signature_text(excerpt)):
         low = tok.lower()
         if low not in seen:
@@ -164,6 +167,15 @@ class PatternStore:
                     "CREATE VIRTUAL TABLE IF NOT EXISTS patterns_fts USING fts5("
                     "sample, project UNINDEXED, signature UNINDEXED)"
                 )
+                # Backfill rows missing from the index — e.g. a DB previously
+                # written with FTS disabled, or created before this table existed.
+                # Without this, those priors stay invisible to fuzzy lookup.
+                self.conn.execute(
+                    "INSERT INTO patterns_fts (sample, project, signature) "
+                    "SELECT sample, project, signature FROM patterns p "
+                    "WHERE NOT EXISTS (SELECT 1 FROM patterns_fts f "
+                    "WHERE f.project = p.project AND f.signature = p.signature)"
+                )
             except sqlite3.Error:
                 # FTS5 vanished between probe and create — degrade gracefully.
                 self.fts = False
@@ -173,7 +185,7 @@ class PatternStore:
 
     def lookup(
         self, project: str, signature: str, excerpt: Optional[str] = None
-    ) -> Optional[Dict[str, object]]:
+    ) -> Optional[dict[str, object]]:
         """Return the prior record for a signature, or a fuzzy match, else None.
 
         Exact ``(project, signature)`` match wins. On a miss, if an *excerpt*
@@ -195,7 +207,7 @@ class PatternStore:
 
     def _fuzzy_lookup(
         self, project: str, excerpt: str
-    ) -> Optional[Dict[str, object]]:
+    ) -> Optional[dict[str, object]]:
         tokens = _fuzzy_tokens(excerpt)
         if not tokens:
             return None
@@ -224,7 +236,7 @@ class PatternStore:
         return self._row_to_dict(row, fuzzy=True)
 
     @staticmethod
-    def _row_to_dict(row: sqlite3.Row, *, fuzzy: bool) -> Dict[str, object]:
+    def _row_to_dict(row: sqlite3.Row, *, fuzzy: bool) -> dict[str, object]:
         return {
             "project": row["project"],
             "signature": row["signature"],
@@ -246,7 +258,7 @@ class PatternStore:
         excerpt: str,
         *,
         now: Optional[datetime] = None,
-    ) -> Dict[str, object]:
+    ) -> dict[str, object]:
         """Upsert a pattern: bump ``occurrences`` and ``last_seen``.
 
         Stores a bounded sample of the excerpt for fuzzy lookup. Runs

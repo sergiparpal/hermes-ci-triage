@@ -24,7 +24,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Optional
 
 from . import classifier, logfetch, patterns, prefilter
 
@@ -46,7 +46,7 @@ def _error(message: str, remediation: str = "") -> str:
     )
 
 
-def _ok(payload: Dict[str, Any]) -> str:
+def _ok(payload: dict[str, Any]) -> str:
     return json.dumps({"success": True, **payload}, ensure_ascii=False)
 
 
@@ -61,6 +61,10 @@ def _resolve_hermes_home(hermes_home: Optional[str]) -> Path:
         from hermes_constants import get_hermes_home  # type: ignore
         return get_hermes_home()
     except Exception:
+        logger.debug(
+            "hermes_constants unavailable; resolving HERMES_HOME from env",
+            exc_info=True,
+        )
         val = (os.environ.get("HERMES_HOME") or "").strip()
         return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
 
@@ -69,7 +73,7 @@ def _db_path(hermes_home: Optional[str]) -> Path:
     return _resolve_hermes_home(hermes_home).joinpath(*_DB_RELATIVE)
 
 
-def _infer_project(args: Dict[str, Any]) -> str:
+def _infer_project(args: dict[str, Any]) -> str:
     explicit = args.get("project")
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
@@ -101,6 +105,7 @@ def _try_enrich(
         try:
             raw = dispatch_tool(tool_name, {arg_key: query})
         except Exception:
+            logger.debug("enrichment via %s failed", tool_name, exc_info=True)
             continue
         if not raw:
             continue
@@ -127,7 +132,7 @@ def _top_signal_line(excerpt: str) -> str:
 # --------------------------------------------------------------------------
 
 def triage_pipeline_failure(
-    args: Dict[str, Any],
+    args: dict[str, Any],
     *,
     llm: Any = None,
     dispatch_tool: Optional[Callable[..., str]] = None,
@@ -169,14 +174,23 @@ def triage_pipeline_failure(
 
     # --- signature + prior ----------------------------------------------
     signature = patterns.compute_signature(excerpt)
-    prior: Optional[Dict[str, Any]] = None
+    # An excerpt that normalises to nothing yields the empty-string signature,
+    # which would collide across all such logs — skip the store entirely.
+    has_signature = bool(patterns.normalize_signature_text(excerpt))
+    prior: Optional[dict[str, Any]] = None
     store: Optional[patterns.PatternStore] = None
-    try:
-        store = patterns.PatternStore(_db_path(hermes_home))
-        prior = store.lookup(project, signature, excerpt)
-    except Exception:
-        logger.warning("pattern store unavailable", exc_info=True)
-        store = None
+    if has_signature:
+        try:
+            store = patterns.PatternStore(_db_path(hermes_home))
+            prior = store.lookup(project, signature, excerpt)
+        except Exception:
+            logger.warning("pattern store unavailable", exc_info=True)
+            if store is not None:
+                try:
+                    store.close()  # don't leak the connection on a lookup error
+                except Exception:
+                    pass
+            store = None
 
     # --- optional enrichment (guarded) ----------------------------------
     enrichment = None
@@ -188,16 +202,20 @@ def triage_pipeline_failure(
 
     # --- record ----------------------------------------------------------
     prior_occurrences = int(prior.get("occurrences", 0)) if prior else 0
+    # Don't teach the store low-signal heuristic defaults — they'd resurface as
+    # noisy fuzzy priors. A confident LLM call on a low-signal log still learns.
+    learn = not (low_signal and result.get("method") == "heuristic")
     if store is not None:
         try:
-            store.record(project, signature, result["category"], excerpt)
+            if learn:
+                store.record(project, signature, result["category"], excerpt)
         except Exception:
             logger.warning("pattern record failed", exc_info=True)
         finally:
             store.close()
 
     # --- respond ---------------------------------------------------------
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "category": result["category"],
         "confidence": round(float(result.get("confidence", 0.0)), 3),
         "summary": result.get("summary", ""),

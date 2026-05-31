@@ -16,13 +16,16 @@ shape of :class:`agent.plugin_llm.PluginLlmStructuredResult`.
 
 from __future__ import annotations
 
+import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 # Fixed taxonomy — the contract. Keep in sync with CLASSIFICATION_SCHEMA.
 TAXONOMY = ["broken_test", "environment", "data", "timeout", "flaky", "infra"]
 
-CLASSIFICATION_SCHEMA: Dict[str, Any] = {
+CLASSIFICATION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "category": {"type": "string", "enum": list(TAXONOMY)},
@@ -104,7 +107,7 @@ _HEURISTIC_RULES = [
 ]
 
 
-def heuristic_classify(excerpt: str) -> Dict[str, Any]:
+def heuristic_classify(excerpt: str) -> dict[str, Any]:
     """Rule-based classification used when the LLM path is unavailable.
 
     Always returns a valid taxonomy category with low confidence and a note.
@@ -149,11 +152,11 @@ def _line_for(text: str, pos: int) -> str:
 
 def _build_input(
     excerpt: str,
-    prior: Optional[Dict[str, Any]],
+    prior: Optional[dict[str, Any]],
     enrichment: Optional[Any],
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Build the structured `input` blocks: excerpt + optional hints, as DATA."""
-    blocks: List[Dict[str, str]] = []
+    blocks: list[dict[str, str]] = []
     if prior:
         blocks.append({
             "type": "text",
@@ -180,7 +183,7 @@ def _build_input(
     return blocks
 
 
-def _coerce(parsed: Any) -> Optional[Dict[str, Any]]:
+def _coerce(parsed: Any) -> Optional[dict[str, Any]]:
     """Validate/normalise a parsed model object into a result dict, or None."""
     if not isinstance(parsed, dict):
         return None
@@ -216,11 +219,11 @@ def classify(
     llm: Any,
     excerpt: str,
     *,
-    prior: Optional[Dict[str, Any]] = None,
+    prior: Optional[dict[str, Any]] = None,
     enrichment: Optional[Any] = None,
     max_tokens: int = 700,
     timeout: float = 60.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Classify *excerpt* into the taxonomy. Never raises.
 
     Tries the structured LLM call first; on any failure, invalid output, or
@@ -244,8 +247,14 @@ def classify(
                 coerced = _coerce(parsed)
                 if coerced is not None:
                     return coerced
-        except Exception:
+        except Exception as exc:
             # Provider error, schema-validation ValueError, malformed output —
-            # all degrade to the heuristic rather than failing the tool.
-            pass
+            # all degrade to the heuristic rather than failing the tool. Log it
+            # so a genuine misintegration (e.g. a changed complete_structured
+            # signature) is diagnosable instead of silently always-heuristic.
+            logger.warning(
+                "LLM classification unavailable (%s); using heuristic fallback",
+                type(exc).__name__,
+            )
+            logger.debug("LLM classification error detail", exc_info=True)
     return heuristic_classify(excerpt)

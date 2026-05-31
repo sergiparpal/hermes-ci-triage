@@ -24,7 +24,6 @@ Design notes:
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Tuple
 
 # --------------------------------------------------------------------------
 # Bounds (defaults — overridable per call)
@@ -77,6 +76,9 @@ _KEYWORD_RE = re.compile(
 _CAMEL_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning)\b")
 
 # Non-zero exit / return codes from shells, make, subprocess, etc.
+# Intentionally over-inclusive: the 'returned N' branch also matches benign
+# phrasing like "returned 5 items". Harmless — everything is bounded by the
+# caps above — so do not "tighten" this without re-checking the cost rationale.
 _EXIT_RE = re.compile(
     r"(?:exit(?:ed)?(?:\ with)?(?:\ code| status)?|returned(?:\ non-zero\ exit\ status)?)"
     r"[:=\s]+([1-9]\d*)\b",
@@ -104,7 +106,13 @@ def strip_ansi(text: str) -> str:
 
 
 def is_failure_line(line: str) -> bool:
-    """Return True when *line* carries a recognised failure signal."""
+    """Return True when *line* carries a recognised failure signal.
+
+    Called once per log line; the per-line regex cost is bounded by the 25 MB
+    fetch cap upstream. Blank lines short-circuit before any regex runs.
+    """
+    if not line:
+        return False
     return bool(
         _KEYWORD_RE.search(line)
         or _CAMEL_RE.search(line)
@@ -118,10 +126,10 @@ def is_failure_line(line: str) -> bool:
 # --------------------------------------------------------------------------
 
 def _merge_windows(
-    hits: List[int], n_lines: int, before: int, after: int
-) -> List[Tuple[int, int]]:
+    hits: list[int], n_lines: int, before: int, after: int
+) -> list[tuple[int, int]]:
     """Turn signal-hit line indices into merged ``[start, end)`` ranges."""
-    ranges: List[Tuple[int, int]] = []
+    ranges: list[tuple[int, int]] = []
     for i in hits:
         start = max(0, i - before)
         end = min(n_lines, i + after + 1)
@@ -132,9 +140,9 @@ def _merge_windows(
     return ranges
 
 
-def _collapse_runs(block: List[str]) -> List[str]:
+def _collapse_runs(block: list[str]) -> list[str]:
     """Collapse runs of identical consecutive lines into one + a marker."""
-    out: List[str] = []
+    out: list[str] = []
     i, n = 0, len(block)
     while i < n:
         j = i
@@ -165,7 +173,7 @@ def prefilter(
     after: int = DEFAULT_AFTER,
     char_cap: int = DEFAULT_CHAR_CAP,
     line_cap: int = DEFAULT_LINE_CAP,
-) -> Tuple[str, Dict[str, object]]:
+) -> tuple[str, dict[str, object]]:
     """Reduce a raw CI log to a bounded, signal-dense excerpt.
 
     Returns ``(excerpt, stats)``. ``stats`` always contains
@@ -180,7 +188,7 @@ def prefilter(
     original_lines = len(lines)
 
     hits = [i for i, ln in enumerate(lines) if is_failure_line(ln)]
-    stats: Dict[str, object] = {
+    stats: dict[str, object] = {
         "original_bytes": original_bytes,
         "original_lines": original_lines,
         "hit_count": len(hits),
@@ -193,7 +201,7 @@ def prefilter(
 
     ranges = _merge_windows(hits, len(lines), before, after)
 
-    parts: List[str] = []
+    parts: list[str] = []
     prev_end = None
     for (start, end) in ranges:
         if prev_end is not None and start > prev_end:

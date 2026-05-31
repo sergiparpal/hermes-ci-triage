@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 
 
 def test_registers_triage_tool(tmp_hermes_home):
+    pytest.importorskip("hermes_cli", reason="hermes-agent not installed")
     from hermes_cli.plugins import PluginManager, PluginManifest, PluginContext
     from tools.registry import registry
     import hermes_plugins.hermes_ci_triage as plugin
@@ -54,6 +57,7 @@ def test_schema_shape_and_no_cross_toolset_names():
 
 def test_registered_handler_returns_json_string(tmp_hermes_home):
     """The registered handler must return a JSON string even on bad input."""
+    pytest.importorskip("hermes_cli", reason="hermes-agent not installed")
     from hermes_cli.plugins import PluginManager, PluginManifest, PluginContext
     from tools.registry import registry
     import hermes_plugins.hermes_ci_triage as plugin

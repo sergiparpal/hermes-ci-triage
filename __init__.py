@@ -74,12 +74,27 @@ TRIAGE_SCHEMA = {
 }
 
 
+def _ver_tuple(raw: Any) -> tuple:
+    """Parse 'X.Y.Z[suffix]' into a 3-tuple, tolerating pre-release suffixes."""
+    out = []
+    for seg in str(raw).split(".")[:3]:
+        digits = ""
+        for ch in seg:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break  # stop at first non-digit, e.g. the 'rc1' in '0rc1'
+        out.append(int(digits) if digits else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
 def _check_version() -> None:
     """Warn (never raise) if the running Hermes predates the baseline."""
     try:
         from hermes_cli import __version__ as raw
-        parts = tuple(int(x) for x in str(raw).split(".")[:3])
-        if parts < _MIN_HERMES_VERSION:
+        if _ver_tuple(raw) < _MIN_HERMES_VERSION:
             logger.warning(
                 "hermes-ci-triage targets Hermes >= %s but found %s; "
                 "proceeding, but some behaviour may differ.",

@@ -178,3 +178,36 @@ def test_low_signal_log_still_succeeds(tmp_path, tmp_hermes_home):
     assert data["success"] is True
     assert data["log_stats"]["low_signal"] is True
     assert data["category"] in classifier.TAXONOMY
+
+
+def test_low_signal_heuristic_is_not_learned(tmp_path, tmp_hermes_home):
+    """L7: low-signal heuristic defaults must not pollute the pattern store."""
+    path = _write(tmp_path, "clean.log", "\n".join(f"step {i} ok" for i in range(40)))
+    args = {"log_url_or_path": path, "project": "lp"}
+    first = json.loads(handlers.triage_pipeline_failure(args, llm=None))
+    assert first["log_stats"]["low_signal"] is True
+    assert first["prior_seen"] is False
+    second = json.loads(handlers.triage_pipeline_failure(args, llm=None))
+    assert second["prior_seen"] is False  # nothing was recorded the first time
+
+
+def test_blank_log_does_not_collide_in_store(tmp_path, tmp_hermes_home):
+    """L1: an excerpt that normalises to empty is never recorded."""
+    path = _write(tmp_path, "blank.log", "   \n\n   \n")
+    args = {"log_url_or_path": path, "project": "bp"}
+    first = json.loads(handlers.triage_pipeline_failure(args, llm=None))
+    assert first["success"] is True
+    assert first["prior_seen"] is False
+    second = json.loads(handlers.triage_pipeline_failure(args, llm=None))
+    assert second["prior_seen"] is False
+
+
+def test_llm_error_is_logged(tmp_path, tmp_hermes_home, caplog):
+    """H1: an LLM failure is logged (not silently swallowed) before fallback."""
+    import logging
+
+    path = _write(tmp_path, "x.log", "No space left on device\n")
+    llm = FakeLlm(raise_exc=ValueError("boom"))
+    with caplog.at_level(logging.WARNING):
+        handlers.triage_pipeline_failure({"log_url_or_path": path}, llm=llm)
+    assert any("heuristic fallback" in r.getMessage() for r in caplog.records)

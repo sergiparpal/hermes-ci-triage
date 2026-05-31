@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -50,20 +51,102 @@ def test_non_https_url_rejected():
     assert "https" in msg
 
 
+class _FakeResp:
+    """Minimal context-manager HTTP response yielding *data* once."""
+
+    def __init__(self, data=b""):
+        self._data = data
+        self._sent = False
+
+    def read(self, _n):
+        if self._sent:
+            return b""
+        self._sent = True
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _CaptureOpener:
+    """Records the Request it was asked to open and returns a canned response."""
+
+    def __init__(self, data=b"log line\nERROR boom\n", raises=None):
+        self.request = None
+        self._data = data
+        self._raises = raises
+
+    def open(self, request, timeout=None):
+        self.request = request
+        if self._raises is not None:
+            raise self._raises
+        return _FakeResp(self._data)
+
+
 def test_missing_token_path_structured_error(monkeypatch):
     """An auth failure (no/insufficient token) surfaces a LogFetchError with a
     GITHUB_TOKEN remediation — no raw traceback leaks."""
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-
-    def fake_urlopen(request, timeout=None, context=None):
-        raise urllib.error.HTTPError(
-            "https://api.github.com/x", 401, "Unauthorized", {}, None
-        )
-
-    monkeypatch.setattr(logfetch.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
+    err = urllib.error.HTTPError(
+        "https://api.github.com/x", 401, "Unauthorized", {}, None
+    )
+    monkeypatch.setattr(logfetch, "_build_opener", lambda ctx: _CaptureOpener(raises=err))
     with pytest.raises(logfetch.LogFetchError) as ei:
         logfetch.fetch_remote("https://api.github.com/repos/o/r/actions/jobs/1/logs")
     assert "GITHUB_TOKEN" in ei.value.remediation
+
+
+def test_token_not_sent_to_foreign_host(monkeypatch):
+    """The token must NOT be attached to a non-GitHub host (credential leak)."""
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
+    cap = _CaptureOpener()
+    monkeypatch.setattr(logfetch, "_build_opener", lambda ctx: cap)
+    out = logfetch.fetch_remote("https://evil.example/log")
+    assert "ERROR boom" in out
+    assert not any(k.lower() == "authorization" for k in cap.request.headers)
+
+
+def test_token_sent_to_github_api(monkeypatch):
+    """The token IS attached for the allow-listed GitHub API host."""
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
+    cap = _CaptureOpener()
+    monkeypatch.setattr(logfetch, "_build_opener", lambda ctx: cap)
+    logfetch.fetch_remote("https://api.github.com/repos/o/r/actions/jobs/1/logs")
+    auth = next(v for k, v in cap.request.headers.items() if k.lower() == "authorization")
+    assert auth == "Bearer secret-token"
+
+
+def test_ssrf_internal_address_rejected(monkeypatch):
+    """A link-local address (e.g. cloud metadata) is refused before any fetch."""
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+    with pytest.raises(logfetch.LogFetchError) as ei:
+        logfetch.fetch_remote("https://169.254.169.254/latest/meta-data/")
+    assert "ssrf" in (str(ei.value) + ei.value.remediation).lower()
+
+
+def test_redirect_strips_auth_cross_host():
+    handler = logfetch._AuthStrippingRedirectHandler()
+    req = urllib.request.Request(
+        "https://api.github.com/x", headers={"Authorization": "Bearer t"}
+    )
+    new = handler.redirect_request(req, None, 302, "Found", {}, "https://blob.example/y")
+    assert new is not None
+    assert not any(k.lower() == "authorization" for k in new.headers)
+
+
+def test_redirect_keeps_auth_same_host():
+    handler = logfetch._AuthStrippingRedirectHandler()
+    req = urllib.request.Request(
+        "https://api.github.com/x", headers={"Authorization": "Bearer t"}
+    )
+    new = handler.redirect_request(req, None, 302, "Found", {}, "https://api.github.com/y")
+    assert any(k.lower() == "authorization" for k in new.headers)
 
 
 def test_fetch_dispatches_local(tmp_path):

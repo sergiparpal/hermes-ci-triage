@@ -57,4 +57,9 @@ def tmp_hermes_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Pin the resolver directly so isolation never depends on whether the real
+    # hermes_constants.get_hermes_home() honours HERMES_HOME at call time —
+    # otherwise handler tests could read/write the operator's real pattern DB.
+    from hermes_plugins.hermes_ci_triage import handlers
+    monkeypatch.setattr(handlers, "_resolve_hermes_home", lambda hermes_home=None: home)
     return home
