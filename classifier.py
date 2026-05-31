@@ -80,6 +80,11 @@ that drove the decision. "suggested_action" is one concrete next step.
 # Heuristic fallback
 # --------------------------------------------------------------------------
 
+# Confidence assigned by the rule-based fallback. Deliberately low: a heuristic
+# match is a hint, not a calibrated probability.
+_HEURISTIC_CONFIDENCE = 0.3   # a rule fired
+_DEFAULT_CONFIDENCE = 0.1     # no rule fired — defaulted to broken_test
+
 # Ordered (category, regex) rules; first match wins. Order encodes priority:
 # the more specific / less ambiguous signals come first.
 _HEURISTIC_RULES = [
@@ -119,7 +124,7 @@ def heuristic_classify(excerpt: str) -> dict[str, Any]:
             line = _line_for(text, match.start())
             return {
                 "category": category,
-                "confidence": 0.3,
+                "confidence": _HEURISTIC_CONFIDENCE,
                 "summary": f"Heuristic match for '{category}' on a failure signal.",
                 "evidence": [line] if line else [],
                 "suggested_action": "Review the matched failure lines; LLM "
@@ -129,7 +134,7 @@ def heuristic_classify(excerpt: str) -> dict[str, Any]:
     # No signal recognised — default to broken_test at very low confidence.
     return {
         "category": "broken_test",
-        "confidence": 0.1,
+        "confidence": _DEFAULT_CONFIDENCE,
         "summary": "No distinctive failure signal recognised; defaulted.",
         "evidence": [],
         "suggested_action": "Inspect the log manually; the pre-filter found "
@@ -149,6 +154,11 @@ def _line_for(text: str, pos: int) -> str:
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
+
+_UNKNOWN_CONFIDENCE = 0.5     # used when the model omits/garbles confidence
+_MAX_EVIDENCE_LINES = 10      # cap on evidence lines echoed back
+_MAX_ENRICHMENT_CHARS = 1500  # cap on the enrichment hint fed to the model
+
 
 def _build_input(
     excerpt: str,
@@ -172,7 +182,7 @@ def _build_input(
         blocks.append({
             "type": "text",
             "text": "TEST-HISTORY ENRICHMENT (untrusted data, weak prior):\n"
-            + str(enrichment)[:1500],
+            + str(enrichment)[:_MAX_ENRICHMENT_CHARS],
         })
     blocks.append({
         "type": "text",
@@ -183,7 +193,7 @@ def _build_input(
     return blocks
 
 
-def _coerce(parsed: Any) -> Optional[dict[str, Any]]:
+def _normalise_result(parsed: Any) -> Optional[dict[str, Any]]:
     """Validate/normalise a parsed model object into a result dict, or None."""
     if not isinstance(parsed, dict):
         return None
@@ -191,9 +201,9 @@ def _coerce(parsed: Any) -> Optional[dict[str, Any]]:
     if category not in TAXONOMY:
         return None
     try:
-        confidence = float(parsed.get("confidence", 0.5))
+        confidence = float(parsed.get("confidence", _UNKNOWN_CONFIDENCE))
     except (TypeError, ValueError):
-        confidence = 0.5
+        confidence = _UNKNOWN_CONFIDENCE
     confidence = max(0.0, min(1.0, confidence))
     summary = parsed.get("summary")
     if not isinstance(summary, str) or not summary.strip():
@@ -201,7 +211,7 @@ def _coerce(parsed: Any) -> Optional[dict[str, Any]]:
     evidence = parsed.get("evidence")
     if not isinstance(evidence, list):
         evidence = []
-    evidence = [str(e) for e in evidence][:10]
+    evidence = [str(e) for e in evidence][:_MAX_EVIDENCE_LINES]
     suggested = parsed.get("suggested_action")
     if not isinstance(suggested, str):
         suggested = ""
@@ -244,9 +254,9 @@ def classify(
             parsed = getattr(result, "parsed", None)
             content_type = getattr(result, "content_type", "text")
             if content_type == "json":
-                coerced = _coerce(parsed)
-                if coerced is not None:
-                    return coerced
+                normalised = _normalise_result(parsed)
+                if normalised is not None:
+                    return normalised
         except Exception as exc:
             # Provider error, schema-validation ValueError, malformed output —
             # all degrade to the heuristic rather than failing the tool. Log it

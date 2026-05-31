@@ -221,9 +221,9 @@ def prefilter(
     # Char cap — keep the tail, then snap to a clean line boundary.
     if len(excerpt) > char_cap:
         excerpt = excerpt[-char_cap:]
-        newline = excerpt.find("\n")
-        if 0 <= newline < len(excerpt) - 1:
-            excerpt = excerpt[newline + 1:]
+        first_nl = excerpt.find("\n")
+        if 0 <= first_nl < len(excerpt) - 1:
+            excerpt = excerpt[first_nl + 1:]
         truncated = True
 
     if truncated:

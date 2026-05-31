@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 # How many tail lines to classify when the log carries no clear failure signal.
 _NO_SIGNAL_TAIL_LINES = 60
+# Cap on the single signal line used to seed enrichment lookups.
+_SIGNAL_LINE_CHARS = 200
 _DB_RELATIVE = ("cache", "ci_triage_patterns.db")
 
 
@@ -87,6 +89,16 @@ def _tail_excerpt(raw: str, n_lines: int = _NO_SIGNAL_TAIL_LINES) -> str:
     return "\n".join(lines[-n_lines:])
 
 
+def _is_unknown_tool(data: Any) -> bool:
+    """True for a registry-miss envelope: a lone ``{"error": "..."}``.
+
+    A tool that actually ran returns more than just an error key, so the
+    single-key shape is what distinguishes 'tool not registered' from a tool
+    that ran and reported a problem worth surfacing.
+    """
+    return isinstance(data, dict) and bool(data.get("error")) and len(data) == 1
+
+
 def _try_enrich(
     dispatch_tool: Optional[Callable[..., str]], excerpt: str
 ) -> Optional[Any]:
@@ -113,8 +125,7 @@ def _try_enrich(
             data = json.loads(raw) if isinstance(raw, str) else raw
         except (json.JSONDecodeError, ValueError):
             data = raw
-        # A registry miss returns {"error": "Unknown tool: ..."}; skip those.
-        if isinstance(data, dict) and data.get("error") and len(data) == 1:
+        if _is_unknown_tool(data):
             continue
         return {"source": tool_name, "result": data}
     return None
@@ -123,8 +134,32 @@ def _try_enrich(
 def _top_signal_line(excerpt: str) -> str:
     for line in (excerpt or "").split("\n"):
         if prefilter.is_failure_line(line):
-            return line.strip()[:200]
-    return (excerpt or "").strip().split("\n")[0][:200]
+            return line.strip()[:_SIGNAL_LINE_CHARS]
+    return (excerpt or "").strip().split("\n")[0][:_SIGNAL_LINE_CHARS]
+
+
+def _open_and_lookup(
+    db_path: Path, project: str, signature: str, excerpt: str
+) -> tuple[Optional[patterns.PatternStore], Optional[dict[str, Any]]]:
+    """Open the pattern store and fetch any prior for *signature*.
+
+    Returns ``(store, prior)`` on success — the caller owns the open store and
+    must close it. On any failure returns ``(None, None)`` with the connection
+    already closed, so the caller's happy path needs only a single
+    ``finally``-close around the later record step.
+    """
+    store: Optional[patterns.PatternStore] = None
+    try:
+        store = patterns.PatternStore(db_path)
+        return store, store.lookup(project, signature, excerpt)
+    except Exception:
+        logger.warning("pattern store unavailable", exc_info=True)
+        if store is not None:
+            try:
+                store.close()  # don't leak the connection on a lookup error
+            except Exception:
+                pass
+        return None, None
 
 
 # --------------------------------------------------------------------------
@@ -177,20 +212,12 @@ def triage_pipeline_failure(
     # An excerpt that normalises to nothing yields the empty-string signature,
     # which would collide across all such logs — skip the store entirely.
     has_signature = bool(patterns.normalize_signature_text(excerpt))
-    prior: Optional[dict[str, Any]] = None
     store: Optional[patterns.PatternStore] = None
+    prior: Optional[dict[str, Any]] = None
     if has_signature:
-        try:
-            store = patterns.PatternStore(_db_path(hermes_home))
-            prior = store.lookup(project, signature, excerpt)
-        except Exception:
-            logger.warning("pattern store unavailable", exc_info=True)
-            if store is not None:
-                try:
-                    store.close()  # don't leak the connection on a lookup error
-                except Exception:
-                    pass
-            store = None
+        store, prior = _open_and_lookup(
+            _db_path(hermes_home), project, signature, excerpt
+        )
 
     # --- optional enrichment (guarded) ----------------------------------
     enrichment = None

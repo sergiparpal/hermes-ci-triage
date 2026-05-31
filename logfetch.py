@@ -40,6 +40,10 @@ DEFAULT_TIMEOUT = 20.0             # seconds, explicit on every network call
 _READ_CHUNK = 65_536
 _USER_AGENT = "hermes-ci-triage/0.1"
 
+# Remediation hints reused across several LogFetchErrors.
+_PERMS_HINT = "Check the path and file permissions."
+_TIMEOUT_HINT = "Retry, or point at a smaller/specific job log."
+
 
 class LogFetchError(Exception):
     """A recoverable log-retrieval failure.
@@ -59,8 +63,8 @@ def is_remote(target: str) -> bool:
     Note: plain ``http://`` is recognised as *remote* here only so it can be
     routed to :func:`fetch_remote`, which then rejects it (HTTPS-only).
     """
-    t = (target or "").strip().lower()
-    return t.startswith("http://") or t.startswith("https://")
+    lowered = (target or "").strip().lower()
+    return lowered.startswith("http://") or lowered.startswith("https://")
 
 
 def has_remote_credentials() -> bool:
@@ -160,6 +164,24 @@ def _build_opener(context: ssl.SSLContext) -> urllib.request.OpenerDirector:
     )
 
 
+def _timeout_error(url: str, timeout: float) -> LogFetchError:
+    """The single source of truth for the fetch-timeout error envelope."""
+    return LogFetchError(f"Timed out after {timeout}s fetching {url}.", _TIMEOUT_HINT)
+
+
+def _read_capped(resp) -> bytes:
+    """Read a response body up to :data:`MAX_LOG_BYTES`, then stop."""
+    chunks: list[bytes] = []
+    total = 0
+    while total < MAX_LOG_BYTES:
+        chunk = resp.read(_READ_CHUNK)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)[:MAX_LOG_BYTES]
+
+
 def read_local(path: str) -> str:
     """Read a local log file with a realpath check and byte cap."""
     real = os.path.realpath(os.path.expanduser(path))
@@ -179,10 +201,7 @@ def read_local(path: str) -> str:
     try:
         size = p.stat().st_size
     except OSError as exc:
-        raise LogFetchError(
-            f"Could not stat log file: {path} ({exc})",
-            "Check the path and file permissions.",
-        )
+        raise LogFetchError(f"Could not stat log file: {path} ({exc})", _PERMS_HINT)
     if size > MAX_LOG_BYTES:
         raise LogFetchError(
             f"Log file too large: {size} bytes (cap {MAX_LOG_BYTES}).",
@@ -192,10 +211,7 @@ def read_local(path: str) -> str:
         with p.open("rb") as fh:
             data = fh.read(MAX_LOG_BYTES)
     except OSError as exc:
-        raise LogFetchError(
-            f"Could not read log file: {path} ({exc})",
-            "Check the path and file permissions.",
-        )
+        raise LogFetchError(f"Could not read log file: {path} ({exc})", _PERMS_HINT)
     return data.decode("utf-8", errors="replace")
 
 
@@ -231,17 +247,8 @@ def fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
     opener = _build_opener(context)
     try:
         with opener.open(request, timeout=timeout) as resp:
-            chunks = []
-            total = 0
-            while True:
-                chunk = resp.read(_READ_CHUNK)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-                if total >= MAX_LOG_BYTES:
-                    break
-        return b"".join(chunks)[:MAX_LOG_BYTES].decode("utf-8", errors="replace")
+            data = _read_capped(resp)
+        return data.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             raise LogFetchError(
@@ -259,17 +266,11 @@ def fetch_remote(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> str:
             "Verify the URL and your network access.",
         )
     except socket.timeout:
-        raise LogFetchError(
-            f"Timed out after {timeout}s fetching {url}.",
-            "Retry, or point at a smaller/specific job log.",
-        )
+        raise _timeout_error(url, timeout)
     except (urllib.error.URLError, ssl.SSLError) as exc:
         reason = getattr(exc, "reason", exc)
         if isinstance(reason, (TimeoutError, socket.timeout)):
-            raise LogFetchError(
-                f"Timed out after {timeout}s fetching {url}.",
-                "Retry, or point at a smaller/specific job log.",
-            )
+            raise _timeout_error(url, timeout)
         raise LogFetchError(
             f"Network error fetching {url}: {reason}",
             "Check connectivity and that the host is reachable.",

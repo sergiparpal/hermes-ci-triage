@@ -29,11 +29,15 @@ from typing import Optional
 
 DEFAULT_RETENTION_DAYS = 180
 DEFAULT_MAX_ROWS_PER_PROJECT = 500
+_SAMPLE_CHARS = 4000   # bounded excerpt stored per pattern for fuzzy lookup
 
 # --------------------------------------------------------------------------
 # Signature normalisation
 # --------------------------------------------------------------------------
 
+# ORDER MATTERS: rules run top-to-bottom, so specific patterns must precede
+# general ones (timestamps before clock times; long hex blobs before the
+# bare-integer catch-all). Reordering can let a greedy rule mask a precise one.
 _NORMALISERS = [
     # ISO-8601-ish timestamps: 2026-05-31T17:04:01.123Z / 2026-05-31 17:04:01
     (re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<TS>"),
@@ -183,6 +187,13 @@ class PatternStore:
 
     # -- reads -------------------------------------------------------------
 
+    def _fetch_row(self, project: str, signature: str) -> Optional[sqlite3.Row]:
+        """The canonical single-pattern read, shared by lookup and record."""
+        return self.conn.execute(
+            "SELECT * FROM patterns WHERE project=? AND signature=?",
+            (project, signature),
+        ).fetchone()
+
     def lookup(
         self, project: str, signature: str, excerpt: Optional[str] = None
     ) -> Optional[dict[str, object]]:
@@ -193,10 +204,7 @@ class PatternStore:
         otherwise) and the most-seen similar prior is returned with
         ``fuzzy=True``.
         """
-        row = self.conn.execute(
-            "SELECT * FROM patterns WHERE project=? AND signature=?",
-            (project, signature),
-        ).fetchone()
+        row = self._fetch_row(project, signature)
         if row is not None:
             return self._row_to_dict(row, fuzzy=False)
         if excerpt:
@@ -265,7 +273,7 @@ class PatternStore:
         retention (age prune + per-project cap) after the write.
         """
         ts = _iso_now(now)
-        sample = (excerpt or "")[:4000]
+        sample = (excerpt or "")[:_SAMPLE_CHARS]
         existing = self.conn.execute(
             "SELECT occurrences FROM patterns WHERE project=? AND signature=?",
             (project, signature),
@@ -283,25 +291,11 @@ class PatternStore:
                 "category=?, sample=? WHERE project=? AND signature=?",
                 (ts, category, sample, project, signature),
             )
-        if self.fts:
-            try:
-                self.conn.execute(
-                    "DELETE FROM patterns_fts WHERE project=? AND signature=?",
-                    (project, signature),
-                )
-                self.conn.execute(
-                    "INSERT INTO patterns_fts (sample, project, signature) "
-                    "VALUES (?, ?, ?)",
-                    (sample, project, signature),
-                )
-            except sqlite3.Error:
-                pass
+        self._fts_delete(project, signature)
+        self._fts_insert(project, signature, sample)
         self.conn.commit()
         self.prune(project, now=now)
-        row = self.conn.execute(
-            "SELECT * FROM patterns WHERE project=? AND signature=?",
-            (project, signature),
-        ).fetchone()
+        row = self._fetch_row(project, signature)
         return self._row_to_dict(row, fuzzy=False) if row else {}
 
     # -- retention ---------------------------------------------------------
@@ -353,14 +347,32 @@ class PatternStore:
             "DELETE FROM patterns WHERE project=? AND signature=?",
             (project, signature),
         )
-        if self.fts:
-            try:
-                self.conn.execute(
-                    "DELETE FROM patterns_fts WHERE project=? AND signature=?",
-                    (project, signature),
-                )
-            except sqlite3.Error:
-                pass
+        self._fts_delete(project, signature)
+
+    # -- FTS index maintenance (best-effort; no-ops when FTS is off) --------
+
+    def _fts_delete(self, project: str, signature: str) -> None:
+        if not self.fts:
+            return
+        try:
+            self.conn.execute(
+                "DELETE FROM patterns_fts WHERE project=? AND signature=?",
+                (project, signature),
+            )
+        except sqlite3.Error:
+            pass
+
+    def _fts_insert(self, project: str, signature: str, sample: str) -> None:
+        if not self.fts:
+            return
+        try:
+            self.conn.execute(
+                "INSERT INTO patterns_fts (sample, project, signature) "
+                "VALUES (?, ?, ?)",
+                (sample, project, signature),
+            )
+        except sqlite3.Error:
+            pass
 
     def count(self, project: Optional[str] = None) -> int:
         if project:
