@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import classifier, logfetch, patterns, prefilter
+from . import classifier, logfetch, patterns, prefilter, redact
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +206,10 @@ def triage_pipeline_failure(
     low_signal = stats.get("hit_count", 0) == 0
     if low_signal:
         excerpt = _tail_excerpt(raw)
+    # Scrub secrets BEFORE the excerpt is hashed, stored, sent to the LLM, used
+    # to seed enrichment, or echoed back. CI logs routinely contain tokens/keys;
+    # everything downstream operates on this redacted form.
+    excerpt = redact.redact(excerpt)
 
     # --- signature + prior ----------------------------------------------
     signature = patterns.compute_signature(excerpt)
@@ -223,6 +227,10 @@ def triage_pipeline_failure(
     enrichment = None
     if enable_enrichment:
         enrichment = _try_enrich(dispatch_tool, excerpt)
+        if enrichment is not None:
+            # Another tool's output may also carry secrets — scrub before it is
+            # fed to the LLM or echoed in the result.
+            enrichment = redact.redact_obj(enrichment)
 
     # --- classify --------------------------------------------------------
     result = classifier.classify(llm, excerpt, prior=prior, enrichment=enrichment)

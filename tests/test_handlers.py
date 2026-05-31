@@ -202,6 +202,29 @@ def test_blank_log_does_not_collide_in_store(tmp_path, tmp_hermes_home):
     assert second["prior_seen"] is False
 
 
+def test_secrets_redacted_in_output(tmp_path, tmp_hermes_home):
+    """M3: secrets in a CI log are not echoed back in the tool result."""
+    secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    log = f"AssertionError: boom\nleaked token={secret}\nFAILED tests/test_x.py\n"
+    path = _write(tmp_path, "x.log", log)
+    out = handlers.triage_pipeline_failure({"log_url_or_path": path}, llm=None)
+    assert secret not in out
+    assert "ghp_" not in out
+    data = json.loads(out)
+    assert data["success"] is True
+    assert data["category"] == "broken_test"  # classification still works
+
+
+def test_secret_excerpt_not_sent_to_llm(tmp_path, tmp_hermes_home):
+    """M3: the excerpt handed to the LLM is already redacted."""
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    path = _write(tmp_path, "x.log", f"AssertionError: boom\naws_key {secret}\n")
+    llm = FakeLlm(parsed={"category": "broken_test", "confidence": 0.9,
+                          "summary": "ok", "evidence": [], "suggested_action": "x"})
+    handlers.triage_pipeline_failure({"log_url_or_path": path}, llm=llm)
+    assert secret not in json.dumps(llm.calls[0]["input"])
+
+
 def test_llm_error_is_logged(tmp_path, tmp_hermes_home, caplog):
     """H1: an LLM failure is logged (not silently swallowed) before fallback."""
     import logging

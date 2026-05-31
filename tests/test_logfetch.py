@@ -130,8 +130,9 @@ def test_ssrf_internal_address_rejected(monkeypatch):
     assert "ssrf" in (str(ei.value) + ei.value.remediation).lower()
 
 
-def test_redirect_strips_auth_cross_host():
-    handler = logfetch._AuthStrippingRedirectHandler()
+def test_redirect_strips_auth_cross_host(monkeypatch):
+    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
+    handler = logfetch._SafeRedirectHandler()
     req = urllib.request.Request(
         "https://api.github.com/x", headers={"Authorization": "Bearer t"}
     )
@@ -140,13 +141,80 @@ def test_redirect_strips_auth_cross_host():
     assert not any(k.lower() == "authorization" for k in new.headers)
 
 
-def test_redirect_keeps_auth_same_host():
-    handler = logfetch._AuthStrippingRedirectHandler()
+def test_redirect_keeps_auth_same_host(monkeypatch):
+    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
+    handler = logfetch._SafeRedirectHandler()
     req = urllib.request.Request(
         "https://api.github.com/x", headers={"Authorization": "Bearer t"}
     )
     new = handler.redirect_request(req, None, 302, "Found", {}, "https://api.github.com/y")
     assert any(k.lower() == "authorization" for k in new.headers)
+
+
+def test_redirect_to_internal_address_refused(monkeypatch):
+    """H1: the SSRF blocklist must apply to redirect targets, not just the
+    initial URL — a public URL must not be able to 302 to cloud metadata."""
+    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: True)
+    handler = logfetch._SafeRedirectHandler()
+    req = urllib.request.Request("https://logs.example/x")
+    with pytest.raises(logfetch.LogFetchError) as ei:
+        handler.redirect_request(
+            req, None, 302, "Found", {}, "https://169.254.169.254/latest/meta-data/"
+        )
+    assert "ssrf" in (str(ei.value) + ei.value.remediation).lower()
+
+
+def test_redirect_to_non_https_refused(monkeypatch):
+    """H1: a redirect that downgrades to http:// must be refused (no scheme
+    downgrade to e.g. http://169.254.169.254/)."""
+    monkeypatch.setattr(logfetch, "_is_blocked_address", lambda host: False)
+    handler = logfetch._SafeRedirectHandler()
+    req = urllib.request.Request("https://logs.example/x")
+    with pytest.raises(logfetch.LogFetchError):
+        handler.redirect_request(req, None, 302, "Found", {}, "http://logs.example/y")
+
+
+def test_private_address_blocked_by_default(monkeypatch):
+    """M1: RFC1918 destinations are blocked unless explicitly opted in; metadata
+    and loopback stay blocked even when private ranges are permitted."""
+    import ipaddress
+
+    monkeypatch.delenv("HERMES_CI_TRIAGE_ALLOW_PRIVATE", raising=False)
+    assert logfetch._ip_blocked(ipaddress.ip_address("10.0.0.5")) is True
+    assert logfetch._ip_blocked(ipaddress.ip_address("192.168.1.1")) is True
+
+    monkeypatch.setenv("HERMES_CI_TRIAGE_ALLOW_PRIVATE", "1")
+    assert logfetch._ip_blocked(ipaddress.ip_address("10.0.0.5")) is False
+    assert logfetch._ip_blocked(ipaddress.ip_address("127.0.0.1")) is True
+    assert logfetch._ip_blocked(ipaddress.ip_address("169.254.169.254")) is True
+
+
+def test_guarded_connection_refuses_resolved_internal_ip(monkeypatch):
+    """M2: connect-time IP vetting refuses a name that resolves to an internal
+    address (closes the DNS-rebinding TOCTOU window)."""
+    conn = logfetch._GuardedHTTPSConnection("rebind.example", 443)
+    monkeypatch.setattr(
+        logfetch.socket, "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, "", ("127.0.0.1", 443))],
+    )
+    with pytest.raises(logfetch.LogFetchError):
+        conn.connect()
+
+
+def test_log_roots_allowlist(tmp_path, monkeypatch):
+    """M3: when HERMES_CI_TRIAGE_LOG_ROOTS is set, reads outside it are refused."""
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    inside = allowed / "build.log"
+    inside.write_text("ERROR boom\n", encoding="utf-8")
+    outside = tmp_path / "secret.log"
+    outside.write_text("ERROR boom\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_CI_TRIAGE_LOG_ROOTS", str(allowed))
+    assert "ERROR boom" in logfetch.read_local(str(inside))
+    with pytest.raises(logfetch.LogFetchError) as ei:
+        logfetch.read_local(str(outside))
+    assert ei.value.remediation
 
 
 def test_fetch_dispatches_local(tmp_path):

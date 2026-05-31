@@ -70,6 +70,8 @@ confidence) — the tool always returns a valid category and never raises.
 |---|---|---|
 | **CI provider (remote fetch)** | **GitHub Actions** | Decision point 1. Sets the token env var and auth header. |
 | `GITHUB_TOKEN` | _(unset)_ | Optional. A `Bearer` token used **only** for fetching protected remote logs. Read at call time. Missing/insufficient → a structured error with remediation, never a crash. |
+| `HERMES_CI_TRIAGE_ALLOW_PRIVATE` | _(unset)_ | Opt-in. Permit fetching logs from RFC1918/private addresses (self-hosted / GitHub Enterprise runners). Off by default; loopback, link-local and cloud-metadata addresses are blocked **regardless** of this setting. |
+| `HERMES_CI_TRIAGE_LOG_ROOTS` | _(unset)_ | Optional `os.pathsep`-separated allowlist of directories local logs may be read from (after symlink resolution). Unset = no restriction; set it to stop the tool being steered into reading arbitrary files. |
 | **`hermes-test-history` enrichment** | **Enabled (guarded)** | Decision point 2. Triage tries `ctx.dispatch_tool("test_failure_lookup", …)` inside `try/except`; if that plugin/tool is absent, enrichment is silently skipped. |
 | Pattern DB | `$HERMES_HOME/cache/ci_triage_patterns.db` | WAL mode; FTS5 used when available, `LIKE` fallback otherwise. Self-pruned: rows older than 180 days and beyond 500 rows/project are evicted on write. |
 
@@ -109,9 +111,16 @@ is no sandbox.** Specifically:
   store). It writes nowhere else.
 - It makes **outbound HTTPS** requests **only** when given an `https://` URL,
   with an explicit 20 s timeout, attaching `GITHUB_TOKEN` as a `Bearer` header
-  when present.
+  when present. Every hop is guarded against SSRF: the scheme (HTTPS-only) and
+  destination address are re-validated on **each redirect** (no http/ftp
+  downgrade, no redirect to internal addresses), the resolved IP is vetted at
+  connect time (DNS-rebinding defence), and loopback/link-local/metadata/(by
+  default) private ranges are refused.
 - Log content is treated as **untrusted data** and never as instructions (see
-  prompt-injection note below).
+  prompt-injection note below). Recognised secrets (tokens, API keys, private
+  keys, `secret=`/`password=` assignments) are **redacted from the excerpt
+  before** it is hashed, sent to the LLM, forwarded to another tool, or echoed
+  back in the result.
 
 ## Security checklist (Hermes best-practices)
 
@@ -124,6 +133,9 @@ is no sandbox.** Specifically:
 - [x] **Log content is treated as untrusted** — the classifier instructions
       explicitly tell the model to ignore any instructions embedded in the log
       and to treat the excerpt as data only.
+- [x] **Secrets are redacted** from the excerpt before it leaves the host (LLM
+      call, enrichment, or result echo), so credentials that leak into a CI log
+      are not propagated further.
 - [x] Structured error envelope on failure: `{success:false, error, remediation}`.
 - [x] Network calls are **HTTPS-only with an explicit timeout**; non-HTTPS URLs
       are rejected.
