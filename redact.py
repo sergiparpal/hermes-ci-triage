@@ -35,21 +35,28 @@ _TOKEN_PATTERNS = [
 ]
 
 # ``key = value`` / ``key: value`` assignments where the key names a secret.
-# Only the value is replaced; the key is kept so the line stays readable for
-# triage. An explicit ':' or '=' separator is required, so prose such as
-# "token not found" (no separator) is left intact.
+# Only the value is replaced; the key (and surrounding quotes, if any) are kept
+# so the line stays readable for triage. An explicit ':' or '=' separator is
+# required, so prose such as "token not found" (no separator) is left intact.
+# The value may be wrapped in matching single/double quotes — common in env
+# dumps and `set -x` output (``PASSWORD="secret"``) — which the value class
+# itself excludes, so they are matched explicitly via an optional quote whose
+# close is a backreference.
 _KV_PATTERN = re.compile(
     r"(?P<key>\b[\w.-]*?"
     r"(?:authorization|bearer|client[_-]?secret|private[_-]?key|access[_-]?key"
     r"|api[_-]?key|apikey|secret|password|passwd|pwd|token)\b)"
     r"(?P<sep>\s*[:=]\s*)"
-    r"(?P<val>(?:bearer\s+)?[^\s\"',;]{4,})",
+    r"(?P<quote>[\"']?)"
+    r"(?P<val>(?:bearer\s+)?[^\s\"',;]{4,})"
+    r"(?P=quote)",
     re.IGNORECASE,
 )
 
 
 def _kv_sub(m: "re.Match") -> str:
-    return f"{m.group('key')}{m.group('sep')}{PLACEHOLDER}"
+    quote = m.group("quote")
+    return f"{m.group('key')}{m.group('sep')}{quote}{PLACEHOLDER}{quote}"
 
 
 def redact(text: str) -> str:

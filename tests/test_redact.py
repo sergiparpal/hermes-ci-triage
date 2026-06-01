@@ -43,6 +43,24 @@ def test_key_value_secret_value_redacted_key_kept():
     assert "API_KEY" in out
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        'password="s3cr3tvalue"',
+        "password='s3cr3tvalue'",
+        'export DB_PASSWORD="s3cr3tvalue"',
+        'client_secret: "s3cr3tvalue"',
+        'authorization: "Bearer s3cr3tvalue"',
+    ],
+)
+def test_quoted_key_value_secret_redacted(line):
+    # Quoted values (env dumps, `set -x`) are common; the value class excludes
+    # quotes, so they must be matched via the explicit optional-quote handling.
+    out = redact.redact(line)
+    assert "s3cr3tvalue" not in out
+    assert redact.PLACEHOLDER in out
+
+
 def test_failure_signals_not_mangled():
     # A redaction pass must never eat the failure signal itself.
     text = (
