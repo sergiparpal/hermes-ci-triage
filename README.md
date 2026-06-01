@@ -47,6 +47,10 @@ Standard-library only. Local-first. No third-party dependencies.
 }
 ```
 
+Two fields appear only when relevant: `prior_match: "fuzzy"` (the prior was a
+fuzzy rather than exact signature match) and `enrichment` (data from the
+optional `hermes-test-history` lookup, when that plugin is present).
+
 **Returns** (failure): `{"success": false, "error": "…", "remediation": "…"}`.
 
 ## Taxonomy (fixed)
@@ -160,6 +164,7 @@ hermes-ci-triage/
 ├── safehttp.py      # hardened HTTPS opener + SSRF address vetting
 ├── logfetch.py      # local/remote retrieval (HTTPS + byte cap)
 ├── prefilter.py     # regex pre-filtering → bounded excerpt
+├── redact.py        # secret scrubbing before the excerpt leaves the host
 ├── classifier.py    # complete_structured + heuristic fallback (taxonomy-driven)
 ├── patterns.py      # SQLite pattern store (signature, FTS5/LIKE, retention)
 ├── enrichment.py    # optional partner test-history lookup (guarded adapter)
@@ -183,5 +188,5 @@ python -m pytest tests/        # uses tests/pytest.ini (importlib import mode)
 
 The suite mocks `ctx.llm` and `ctx.dispatch_tool` — no live provider is
 required. It covers registration, log fetching, pre-filtering, signature
-normalisation, the SQLite store (incl. FTS-off fallback and retention), and the
-full handler pipeline across all six taxonomy categories.
+normalisation, secret redaction, the SQLite store (incl. FTS-off fallback and
+retention), and the full handler pipeline across all six taxonomy categories.
